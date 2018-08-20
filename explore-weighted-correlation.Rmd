@@ -1,0 +1,159 @@
+---
+title: "Explore using weight correlation to estimate gene correlation in scRNA-seq data"
+author: "Stephanie Hicks"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Load libraries
+```{r, warning=FALSE, message=FALSE}
+
+library(MASS)
+```
+
+
+## Summary
+
+The purpose of this document is to explore the idea of using weighted least squares as a way to downweight observations for the $i^{th}$ cell and $j^{th}$ gene that have a high probability of being a dropout in scRNA-seq data.
+
+## Simulation: multivariate normal setting
+
+Start with a covariance matrix and convert to a correlation matrix 
+```{r}
+Sig = diag(c(1,16))
+Sig[1,2] = Sig[2,1] = 3.6 
+Sig # population covariance matrix
+
+rho = solve(sqrt(diag(diag(Sig)))) %*% Sig %*% solve(sqrt(diag(diag(Sig)))); 
+rho # population correlation matrix
+```
+We expect these two genes to be strongly correlated.
+
+Next, simulate correlated gene expression of two genes across $N$ cells
+```{r}
+Z = mvrnorm(1000, mu = c(5, 12), Sigma = Sig)
+plot(Z[,1], Z[,2], xlab = "Expression (gene 1)", 
+     ylab = "Expression (gene 2)") # scatter plot expression of two correlated genes 
+cor(Z, method = "pearson") # sample correlation coefficient
+```
+
+Next, we induce some dropouts as a function of the overall gene expression. We see for low expression there is a high probability of dropout. 
+
+```{r}
+# pick parameters for dropout 
+p.drop <- matrix(0, nrow=dim(Z)[1], ncol=dim(Z)[2]) # initalize a probability of a dropout
+f <- function(x) {1 - 1 / (1+ exp(-(x-3)/.5 )) }
+plot(seq(0, 20, by =.1), f(seq(0, 20, by =.1)), 
+     xlab = "Expression", ylab = "P(dropout)")
+```
+
+```{r}
+p.drop <- f(abs(Z)) # probability of a dropout
+head(Z)
+head(round(p.drop, 3)) 
+# smaller the expression, higher the probablity of dropout
+```
+
+Then, we randomly dropout genes using the probability of a dropout. For each gene and each cell, we  
+```{r}
+Zvec <- as.vector(Z)
+zz <- vector(mode="numeric", length(Zvec))
+newp <- as.vector(p.drop)
+
+for(i in 1:length(Zvec)){
+  zz[i] <- sample(c(1, 0), 1, prob = c(1-newp[i], newp[i])) # 1 = original observation; 0 = dropout
+}
+
+Zind <- matrix(zz, nrow=dim(Z)[1], ncol=dim(Z)[2]) 
+Zdrop <- matrix(ifelse(zz == 1, Zvec, 0 ), nrow=dim(Z)[1], ncol=dim(Z)[2]) # gene expression with dropouts
+```
+
+We can plot the pairwise gene expression with and without dropouts
+```{r, fig.width=10}
+par(mfrow=c(1,2))
+plot(Z[,1], Z[,2], main = "No dropouts", 
+     xlim = c(0, 9), ylim = c(0, 25),
+     xlab = "Expression (gene 1)", ylab = "Expression (gene 2)") 
+plot(Zdrop[,1], Zdrop[,2], main = "With dropouts",
+     xlim = c(0, 9), ylim = c(0, 25),
+     xlab = "Expression (gene 1)", ylab = "Expression (gene 2)")
+```
+
+We can calculate the sample correlation in the case without dropouts
+```{r}
+### sample correlation without dropout
+cor(Z)
+
+# which matches
+(nrow(Z) / (nrow(Z)-1)) * 
+  ((t(Z[,1]) %*% t(t(Z[,2]))) / nrow(Z) - (mean(Z[,1])*mean(Z[,2]))) /
+          sqrt(var(Z[,1]) * var(Z[,2]))
+```
+
+And we can calculate the sample correlation in the case with dropouts
+```{r}
+### sample correlation with dropout
+cor(Zdrop)
+# matches
+(nrow(Zdrop) / (nrow(Zdrop)-1) ) * 
+  ( (t(Zdrop[,1]) %*% t(t(Zdrop[,2]))) / nrow(Zdrop) - (mean(Zdrop[,1])*mean(Zdrop[,2])) ) /
+  sqrt(var(Zdrop[,1]) * var(Zdrop[,2]))
+```
+
+Finally, we can compare least squares and weighted least squares on data with dropouts. Remember the least square estimator of $\beta$ is 
+$$ \hat{\beta} = (X^{T} X)^{-1} X^{T} y $$ 
+and the weighted least squares estimator is 
+$$ \hat{\beta} = (X^{T} \Sigma^{-1} X)^{-1} X^{T} \Sigma^{-1} y $$ 
+where $\Sigma$ is the diagnoal matrix of prior weights. 
+
+```{r, fig.width=12}
+par(mfrow=c(1,3))
+### Least squares without dropouts
+fit = lm(Z[,2] ~ Z[,1]); summary(fit)
+# same as 
+Z.mat <- cbind(rep(1, nrow(Z)), Z[,1]) 
+solve(t(Z.mat) %*% t(t(Z.mat))) %*% t(Z.mat) %*% t(t(Z[,2]))
+
+plot(Z, main = "No dropouts; least squares", 
+     xlim = c(0, 9), ylim = c(0, 25),
+     xlab = "Expression (gene 1)", ylab = "Expression (gene 2)") 
+abline(coef(fit)[1], coef(fit)[2])
+
+
+### Least squares with dropouts
+fit = lm(Zdrop[,2] ~ Zdrop[,1]); summary(fit)
+# same as 
+Zdrop.mat <- cbind(rep(1, nrow(Zdrop)), Zdrop[,1])
+solve(t(Zdrop.mat) %*% t(t(Zdrop.mat))) %*% t(Zdrop.mat) %*% t(t(Zdrop[,2]))
+
+plot(Zdrop, main = "With dropouts (least squares)", 
+     xlim = c(0, 9), ylim = c(0, 25),
+     xlab = "Expression (gene 1)", ylab = "Expression (gene 2)")  
+abline(coef(fit)[1], coef(fit)[2])
+
+### Weighted least squares with dropouts
+w = apply(Zind * matrix(rbeta(nrow(Zind)*ncol(Zind), 1, 0.1), 
+                        nrow=nrow(Zind), ncol=ncol(Zind)), 1, FUN="prod")
+# w[min(w) == w] <- 10^(-6)
+W = w*diag(nrow(Z))
+
+#coef.W <- solve(t(Zdrop.mat) %*% solve(W) %*% t(t(Zdrop.mat))) %*% t(Zdrop.mat) %*% solve(W) %*% t(t(Zdrop[,2])); coef.W
+plot(Zdrop, main = "With dropouts (weighted least squares)", 
+     xlim = c(0, 9), ylim = c(0, 25),
+     xlab = "Expression (gene 1)", ylab = "Expression (gene 2)") 
+# abline(coef.W[1], coef.W[2])
+```
+
+
+
+```{r}
+cor(Z) # sample correlation without dropout
+cor(Zdrop) # sample correlation with dropout
+boot::corr(Zdrop, w = w) # weight least squares to correct for dropout
+```
+
+
+
